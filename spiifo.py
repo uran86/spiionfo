@@ -1,129 +1,145 @@
-import tkinter as tk
-from tkinter import messagebox, simpledialog, scrolledtext
-import sqlite3
-import requests
-from bs4 import BeautifulSoup
-import threading
-import datetime
-import time
+# spiinfo_app.py
+import streamlit as st
+import os
+import pickle
+import json
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import speech_recognition as sr
 
-DB_NAME = 'spiinfo.db'
+# --- Inställningar ---
+model = SentenceTransformer('all-MiniLM-L6-v2')
+DB_PATH = "spiinfo_local_db.pkl"
+
+# --- Enkel lösenordsskydd ---
+def authenticate():
+    if "authenticated" not in st.session_state:
+        pwd = st.text_input("Ange lösenord för att öppna SPIINFO:", type="password")
+        if st.button("Logga in"):
+            if pwd == "spi123":
+                st.session_state.authenticated = True
+                st.experimental_rerun()
+            else:
+                st.error("Fel lösenord!")
+    return st.session_state.get("authenticated", False)
 
 # --- Databasfunktioner ---
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS snipps (
-                    id INTEGER PRIMARY KEY,
-                    content TEXT,
-                    summary TEXT,
-                    source TEXT,
-                    timestamp TEXT
-                )''')
-    conn.commit()
-    conn.close()
+def load_db():
+    if os.path.exists(DB_PATH):
+        with open(DB_PATH, "rb") as f:
+            return pickle.load(f)
+    return {"texts": [], "embeddings": [], "tags": []}
 
-def save_snipp(content, summary, source):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT INTO snipps (content, summary, source, timestamp) VALUES (?, ?, ?, ?)",
-              (content, summary, source, datetime.datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+def save_db():
+    with open(DB_PATH, "wb") as f:
+        pickle.dump(database, f)
 
-def get_all_snipps():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT content, summary, source, timestamp FROM snipps ORDER BY timestamp DESC")
-    rows = c.fetchall()
-    conn.close()
-    return rows
+def add_knowledge(text, tags):
+    embedding = model.encode(text)
+    database["texts"].append(text)
+    database["embeddings"].append(embedding)
+    database["tags"].append(tags)
+    save_db()
 
-# --- Textbearbetning (enkel sammanfattning) ---
-def summarize_text(text):
-    lines = text.strip().split('. ')
-    return '. '.join(lines[:2]) + ('.' if len(lines) > 2 else '')
+def search_knowledge(query, top_k=5):
+    if not database["embeddings"]:
+        return []
+    query_embedding = model.encode(query)
+    similarities = cosine_similarity([query_embedding], database["embeddings"])[0]
+    top_indices = np.argsort(similarities)[-top_k:][::-1]
+    return [(database["texts"][i], similarities[i], database["tags"][i]) for i in top_indices]
 
-# --- Hämta text från URL ---
-def fetch_url_text(url):
+# --- Röstinmatning ---
+def recognize_speech():
+    r = sr.Recognizer()
+    with sr.Microphone() as source:
+        st.info("Lyssnar... prata nu")
+        audio = r.listen(source)
     try:
-        r = requests.get(url)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        paragraphs = soup.find_all('p')
-        text = '\n'.join([p.get_text() for p in paragraphs])
-        return text.strip()
-    except Exception as e:
-        return f"Fel vid hämtning: {e}"
+        return r.recognize_google(audio, language="sv-SE")
+    except sr.UnknownValueError:
+        st.error("Kunde inte förstå ljudet.")
+    except sr.RequestError:
+        st.error("Kunde inte kontakta rösttjänsten.")
+    return ""
 
-# --- GUI ---
-class SpiInfoApp:
-    def __init__(self, root):
-        self.root = root
-        root.title("SPIINFO v1 - Ditt superminne")
+# --- Export / Import ---
+def export_to_json():
+    with open("spiinfo_export.json", "w", encoding="utf-8") as f:
+        json.dump(database, f, ensure_ascii=False, indent=2)
 
-        self.text_input = scrolledtext.ScrolledText(root, width=60, height=10)
-        self.text_input.pack(padx=10, pady=10)
+def import_from_json():
+    try:
+        with open("spiinfo_export.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+            database["texts"].extend(data["texts"])
+            database["embeddings"].extend(data["embeddings"])
+            database["tags"].extend(data.get("tags", [""] * len(data["texts"])))
+            save_db()
+    except FileNotFoundError:
+        st.error("Ingen exportfil spiinfo_export.json hittades.")
 
-        self.url_button = tk.Button(root, text="Hämta från URL", command=self.get_from_url)
-        self.url_button.pack(pady=(0,5))
+# --- App start ---
+if not authenticate():
+    st.stop()
 
-        self.save_button = tk.Button(root, text="Minns detta", command=self.save_current_snipp)
-        self.save_button.pack()
+database = load_db()
 
-        self.show_button = tk.Button(root, text="Visa alla snippar", command=self.show_snipps)
-        self.show_button.pack(pady=(5,10))
+st.set_page_config(page_title="🧠 SPIINFO v3 – Offline", layout="wide")
+st.title("🧠 SPIINFO v3 – Offline AI-minne")
 
-        self.start_clipboard_monitor()
+menu = st.sidebar.selectbox("Välj funktion", [
+    "➕ Lägg till kunskap",
+    "🎙️ Prata till SPIINFO",
+    "❓ Fråga SPIINFO",
+    "📂 Visa minne",
+    "📤 Exportera",
+    "📥 Importera"
+])
 
-    def get_from_url(self):
-        url = simpledialog.askstring("Ange URL", "Klistra in en webbadress:")
-        if url:
-            text = fetch_url_text(url)
-            self.text_input.delete("1.0", tk.END)
-            self.text_input.insert(tk.END, text)
+if menu == "➕ Lägg till kunskap":
+    st.subheader("Lägg till ny kunskap")
+    user_input = st.text_area("Skriv eller klistra in text här:")
+    tags = st.text_input("Lägg till taggar (t.ex. #historia #vetenskap):")
+    if st.button("Minns detta") and user_input.strip():
+        add_knowledge(user_input, tags)
+        st.success("SPIINFO har lärt sig det här!")
 
-    def save_current_snipp(self):
-        content = self.text_input.get("1.0", tk.END).strip()
-        if not content:
-            messagebox.showwarning("Ingen text", "Skriv eller hämta något först.")
-            return
-        summary = summarize_text(content)
-        save_snipp(content, summary, "Manuell/URL")
-        messagebox.showinfo("Sparat", "Snipp sparad i ditt minne!")
-        self.text_input.delete("1.0", tk.END)
+elif menu == "🎙️ Prata till SPIINFO":
+    st.subheader("Prata in ny kunskap")
+    if st.button("🎤 Spela in"):
+        spoken_text = recognize_speech()
+        if spoken_text:
+            st.text_area("Din inlästa text:", value=spoken_text, height=100)
+            tags = st.text_input("Lägg till taggar:", key="voice_tags")
+            if st.button("Minns detta", key="voice_save"):
+                add_knowledge(spoken_text, tags)
+                st.success("SPIINFO har lärt sig vad du sa!")
 
-    def show_snipps(self):
-        snipps = get_all_snipps()
-        new_window = tk.Toplevel(self.root)
-        new_window.title("Dina snippar")
+elif menu == "❓ Fråga SPIINFO":
+    st.subheader("Fråga din AI")
+    query = st.text_input("Vad vill du veta?")
+    if query:
+        results = search_knowledge(query)
+        if results:
+            st.markdown("### 💡 Svar från SPIINFO:")
+            for i, (text, score, tags) in enumerate(results):
+                st.markdown(f"**{i+1}.** Likhet: {score:.2f} – Taggar: {tags}\n{text}")
+        else:
+            st.info("SPIINFO har inget relevant minne än.")
 
-        text_area = scrolledtext.ScrolledText(new_window, width=80, height=20)
-        text_area.pack(padx=10, pady=10)
+elif menu == "📂 Visa minne":
+    st.subheader("Alla snippar i minnet")
+    tag_filter = st.text_input("Filtrera på tagg (valfritt):").lower()
+    for i, text in enumerate(database["texts"]):
+        if tag_filter in database["tags"][i].lower():
+            st.markdown(f"---\n**{i+1}.** {text}\n_Taggar: {database['tags'][i]}_")
 
-        for s in snipps:
-            content, summary, source, timestamp = s
-            text_area.insert(tk.END, f"[{timestamp}] ({source})\n{summary}\n---\n")
+elif menu == "📤 Exportera":
+    export_to_json()
+    st.success("Minnet har exporterats till spiinfo_export.json")
 
-    def start_clipboard_monitor(self):
-        def monitor():
-            last_text = ""
-            while True:
-                try:
-                    current = self.root.clipboard_get()
-                    if current != last_text and len(current) > 20:
-                        summary = summarize_text(current)
-                        save_snipp(current, summary, "Clipboard")
-                        print(f"[SPIINFO] Ny snipp från clipboard sparad.")
-                        last_text = current
-                except:
-                    pass
-                time.sleep(2)
-
-        threading.Thread(target=monitor, daemon=True).start()
-
-# --- Starta appen ---
-if __name__ == '__main__':
-    init_db()
-    root = tk.Tk()
-    app = SpiInfoApp(root)
-    root.mainloop()
+elif menu == "📥 Importera":
+    import_from_json()
+    st.success("Minnet har importerats från spiinfo_export.json")
