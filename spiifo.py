@@ -1,101 +1,92 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-import pickle
-import os
+import trafilatura
+import os, pickle
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# Initiera modellen och databasfil
+st.set_page_config(layout="wide")
 model = SentenceTransformer('all-MiniLM-L6-v2')
-DB_PATH = "spiinfo_db.pkl"
+DB_FILE = "spiinfo_memory.pkl"
 
-# Ladda/spara databas
 def load_db():
-    if os.path.exists(DB_PATH):
-        with open(DB_PATH, "rb") as f:
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "rb") as f:
             return pickle.load(f)
     return {"texts": [], "embeddings": [], "urls": []}
 
 def save_db(db):
-    with open(DB_PATH, "wb") as f:
+    with open(DB_FILE, "wb") as f:
         pickle.dump(db, f)
 
-def add_knowledge(text, url=""):
-    embedding = model.encode(text)
-    database["texts"].append(text)
-    database["embeddings"].append(embedding)
-    database["urls"].append(url)
-    save_db(database)
+db = load_db()
 
-def search_knowledge(query, top_k=5):
-    if not database["embeddings"]:
-        return []
-    query_embedding = model.encode(query)
-    similarities = cosine_similarity([query_embedding], database["embeddings"])[0]
-    top_indices = np.argsort(similarities)[-top_k:][::-1]
-    return [(database["texts"][i], similarities[i], database["urls"][i]) for i in top_indices]
-
-# Web scraping-funktion
-def scrape_text_from_url(url):
+def smart_scrape(url):
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
-        r = requests.get(url, headers=headers, timeout=10)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+        html = requests.get(url, headers=headers, timeout=10).text
 
-        # Ta bort script och style
-        for script in soup(["script", "style"]):
-            script.decompose()
-
-        # Hämta text och rensa whitespace
-        text = soup.get_text(separator=' ')
-        text = ' '.join(text.split())
-        return text[:5000]  # Begränsa max textlängd för prestanda
+        # Försök extrahera relevant artikeltext
+        result = trafilatura.extract(html, include_comments=False, include_tables=False)
+        if result:
+            return result
+        else:
+            # Fallback: ta med synlig text från <p> och <h> taggar
+            soup = BeautifulSoup(html, "html.parser")
+            text = " ".join(tag.get_text() for tag in soup.find_all(['p', 'h1', 'h2', 'h3']))
+            return text[:5000]
     except Exception as e:
-        st.error(f"Misslyckades att hämta URL: {e}")
+        st.error(f"Kunde inte hämta data: {e}")
         return ""
 
-# --- App start ---
-st.title("SPIINFO v4 - Web Scraping och AI-minne")
+def remember(text, url):
+    embedding = model.encode(text)
+    db["texts"].append(text)
+    db["embeddings"].append(embedding)
+    db["urls"].append(url)
+    save_db(db)
 
-database = load_db()
+def semantic_search(query, top_k=5):
+    if not db["embeddings"]:
+        return []
+    query_emb = model.encode(query)
+    sims = cosine_similarity([query_emb], db["embeddings"])[0]
+    idxs = np.argsort(sims)[-top_k:][::-1]
+    return [(db["texts"][i], sims[i], db["urls"][i]) for i in idxs]
 
-menu = st.sidebar.selectbox("Välj funktion", [
-    "➕ Lägg till kunskap från URL",
-    "❓ Fråga SPIINFO",
-    "📂 Visa minnet"
-])
+# 🧠 GUI
+st.title("SPIINFO v5 – Smart Web Scraper AI")
+menu = st.sidebar.radio("Välj", ["📥 Hämta från webben", "🔍 Fråga minnet", "🧾 Visa allt minne"])
 
-if menu == "➕ Lägg till kunskap från URL":
-    st.subheader("Lägg till text från webbsida")
-    url = st.text_input("Ange URL att skrapa")
-    if st.button("Hämta och minns"):
+if menu == "📥 Hämta från webben":
+    url = st.text_input("Ange en URL att analysera")
+    if st.button("Hämta & lär"):
         if url:
-            scraped_text = scrape_text_from_url(url)
-            if scraped_text:
-                st.text_area("Inhämtad text (förhandsvisning):", scraped_text, height=300)
-                add_knowledge(scraped_text, url)
-                st.success("SPIINFO har lärt sig innehållet från sidan!")
+            scraped = smart_scrape(url)
+            if scraped:
+                st.success("Innehåll hämtat! Förhandsvisning nedan:")
+                st.text_area("Utdrag", scraped[:1500])
+                remember(scraped, url)
+            else:
+                st.warning("Kunde inte hämta vettigt innehåll.")
         else:
             st.warning("Ange en giltig URL.")
 
-elif menu == "❓ Fråga SPIINFO":
-    st.subheader("Fråga din AI")
-    query = st.text_input("Skriv din fråga här")
+elif menu == "🔍 Fråga minnet":
+    query = st.text_input("Vad vill du veta?")
     if query:
-        results = search_knowledge(query)
+        results = semantic_search(query)
         if results:
             for i, (text, score, url) in enumerate(results):
-                st.markdown(f"### Resultat {i+1} (Likhet: {score:.2f})")
-                st.markdown(f"URL: {url}")
+                st.markdown(f"### {i+1}. Likhet: {score:.2f}")
+                st.markdown(f"🔗 {url}")
                 st.write(text[:1000] + "...")
         else:
-            st.info("SPIINFO har inget minne än.")
+            st.info("Inget sparat minne än.")
 
-elif menu == "📂 Visa minnet":
-    st.subheader("All text sparad i SPIINFO")
-    for i, (text, url) in enumerate(zip(database["texts"], database["urls"])):
-        st.markdown(f"---\n**{i+1}. URL:** {url}\n{text[:500]}...")
-
+elif menu == "🧾 Visa allt minne":
+    st.subheader("🧠 SPIINFOs minne")
+    for i, (txt, url) in enumerate(zip(db["texts"], db["urls"])):
+        st.markdown(f"---\n**{i+1} – {url}**\n{txt[:700]}...")
