@@ -3,4 +3,3 @@ chromadb
 sentence-transformers
 scikit-learn
 SpeechRecognition
-pyaudio
